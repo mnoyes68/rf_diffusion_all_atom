@@ -39,6 +39,9 @@ import copy
 
 import e3nn.o3 as o3
 
+from torch_geometric.data import Data
+from torch_geometric.transforms import RadiusGraph
+
 def warm_up_spherical_harmonics():
     ''' o3.spherical_harmonics returns different values on 1st call vs all subsequent calls
     All subsequent calls are reproducible.
@@ -72,7 +75,12 @@ def get_seeds():
 @hydra.main(version_base=None, config_path='config/inference', config_name='aa')
 def main(conf: HydraConfig) -> None:
     sampler = get_sampler(conf)
-    sample(sampler, conf)
+
+    print("Loading Trajectory Model")
+    trajectory_model = torch.jit.load(conf.inference.trajectory_model_path)
+    print("Loaded Trajectory Model")
+
+    sample(sampler, conf, trajectory_model)
 
 def get_sampler(conf):
     if conf.inference.deterministic:
@@ -116,11 +124,7 @@ class Particle:
         px0_xyz_stack=None,
         seq_stack=None,
         rfo=None,
-        prev_twist=None,
-        new_twist=None,
-        opt_lp=None,
-        cond_lp=None,
-        log_weight=None
+        weight=None
     ):
         self.indep = indep
         self.is_diffused = is_diffused
@@ -135,16 +139,7 @@ class Particle:
         self.rfo = rfo
 
         # Stats from sampling
-        self.prev_twist = prev_twist
-        self.new_twist = new_twist
-        self.opt_lp = opt_lp
-        self.cond_lp = cond_lp
-        self.log_weight = log_weight
-    
-    def shift_twist(self):
-        """The new twist is now the previous"""
-        self.prev_twist = self.new_twist.clone()
-        self.new_twist = None
+        self.weight = weight
 
     def clone(self):
         """Clone this particle to continue diffusing"""
@@ -158,12 +153,7 @@ class Particle:
         px0_xyz_stack = [p.clone() for p in self.px0_xyz_stack]
         seq_stack = [s.clone() for s in self.seq_stack]
         rfo = self.rfo.clone()
-
-        prev_twist = self.prev_twist.clone()
-        new_twist = self.new_twist.clone()
-        opt_lp = self.opt_lp.clone()
-        cond_lp = self.cond_lp.clone()
-        log_weight = self.log_weight.clone()
+        weight = self.weight.clone()
 
         return type(self)(
             indep,
@@ -175,11 +165,7 @@ class Particle:
             px0_xyz_stack,
             seq_stack,
             rfo,
-            prev_twist,
-            new_twist,
-            opt_lp,
-            cond_lp,
-            log_weight
+            weight
         )
 
 
@@ -192,20 +178,17 @@ def resample(particles: list[Particle]) -> list[Particle]:
     queries = torch.clamp(queries, 0.0, 1.0 - 1e-6)
 
     # Get the weights
-    log_w = torch.Tensor([p.log_weight for p in particles])
-    if torch.isnan(log_w).any():
-        print("NAN Detected, skipping resampling")
-        return particles
-    w = torch.exp(log_w - log_w.max())
-    w_sort = w.sort(descending=True)
-    w = w_sort.values
-    norm_w = w / w.sum()
+    weights = torch.Tensor([p.weight for p in particles])
+    if torch.isnan(weight).any():
+        raise ValueError("NaN detected during resampling")
+    weights = weights / torch.sum(weights)
+    weights = weights.sort(descending=True).values
 
     # Resort particles
-    particles = [particles[i] for i in w_sort.indices]
+    particles = [particles[i] for i in weights.indices]
 
     # Get the indices to resample
-    cumulative = torch.cumsum(norm_w, dim=0)
+    cumulative = torch.cumsum(weights, dim=0)
     indices = torch.searchsorted(cumulative, queries, right=True)
 
     # Resample
@@ -222,11 +205,24 @@ def resample(particles: list[Particle]) -> list[Particle]:
         # Save and continue
         resampled_particles.append(p)
         seen_indices.add(i)
-    
+
+    print(f"Resampling complete: {list(seen_indices)}")
     return resampled_particles
 
 
-def sample(sampler, conf):
+def evaluate_trajectory(particles, t, trajectory_model):
+    transform = RadiusGraph(r=4)
+    for p in particles:
+        xyz = p.indep.xyz
+        coords = xyz[:, [0, 1, 2], :].reshape(-1, 3)
+
+        pos = torch.tensor(coords, dtype=torch.float)
+        meta = torch.tensor(t/200, dtype=torch.float).to(device)
+        data = Data(pos=pos, meta=meta)
+        data = transform(data)
+
+
+def sample(sampler, conf, trajectory_model):
     inf = conf.inference
 
     log = logging.getLogger(__name__)
@@ -240,12 +236,12 @@ def sample(sampler, conf):
         out_prefix = f"{sampler.inf_conf.output_prefix}_{i_des}"
         sampler.output_prefix = out_prefix
         log.info(f'Making batch design {i_des} of {des_i_start}:{des_i_end}')
-        particles, weight_history = sample_batch(sampler, conf, i_des)
+        particles = sample_batch(sampler, conf, i_des, trajectory_model)
         log.info(f'Finished batch design in {(time.time()-start_time)/60:.2f} minutes')
-        save_outputs(sampler, particles, weight_history)
+        save_outputs(sampler, particles)
 
 
-def sample_batch(sampler, conf, i_des, simple_logging=False):
+def sample_batch(sampler, conf, i_des, trajectory_model, simple_logging=False):
     particles = []
     for i in range(conf.inference.particles):
         indep, is_diffused, is_seq_masked, denoiser, contig_map = sampler.sample_init()
@@ -254,21 +250,23 @@ def sample_batch(sampler, conf, i_des, simple_logging=False):
         )
 
     # Loop over number of reverse diffusion time steps.
-    weight_history = {}
     for t in range(int(conf.diffuser.T), conf.inference.final_step-1, -1):
-        if t < int(conf.diffuser.T) - 1:
+        # if t in conf.inference.resample_schedule:
+        if t < 2:
+            evaluate_trajectory(particles, t, trajectory_model)
             particles = resample(particles)
 
         for particle in particles:
-            particle.shift_twist()
             indep = particle.indep
             rfo = particle.rfo
-            px0, x_t, seq_t, opt_lp, cond_lp, p_t, tors_t, plddt, rfo = (
-                sampler.sample_step(t, particle)
+            # px0, x_t, seq_t, opt_lp, cond_lp, p_t, tors_t, plddt, rfo = (
+            #     sampler.sample_step(t, particle)
+            # )
+            px0, x_t, seq_t, tors_t, plddt, rfo = sampler.sample_step(
+                t, indep, rfo
             )
             rf2aa.tensor_util.assert_same_shape(indep.xyz, x_t)
             indep.xyz = x_t
-            particle.new_twist = p_t
 
             aa_model.assert_has_coords(indep.xyz, indep)
 
@@ -277,35 +275,6 @@ def sample_batch(sampler, conf, i_des, simple_logging=False):
             particle.denoised_xyz_stack.append(x_t)
             particle.seq_stack.append(seq_t)
             particle.rfo = rfo
-            particle.opt_lp = opt_lp
-            particle.cond_lp = cond_lp
-        
-        # Calculate weights
-        weight_stats = []
-
-        if t >= int(conf.diffuser.T):
-            # Initialize weight and move on
-            for i, particle in enumerate(particles):
-                particle.log_weight = particle.new_twist
-        else:
-            for i, particle in enumerate(particles):
-                twist_prev = particle.prev_twist
-                twist_new = particle.new_twist
-                opt_lp = particle.opt_lp
-                cond_lp = particle.cond_lp
-                log_weight = opt_lp + twist_new - cond_lp - twist_prev
-                particle.log_weight = log_weight
-                ws = {
-                    "lp_optimal": float(opt_lp),
-                    "lp_conditional": float(cond_lp),
-                    "twist_prev": float(twist_prev),
-                    "twist_new": float(twist_new),
-                    "log_weight": float(log_weight),
-                }
-                weight_stats.append(ws)
-
-        if len(weight_stats) > 0:
-            weight_history[t] = weight_stats
 
     # Flip order for better visualization in pymol
     for particle in particles:
@@ -314,10 +283,10 @@ def sample_batch(sampler, conf, i_des, simple_logging=False):
         particle.px0_xyz_stack = torch.stack(particle.px0_xyz_stack)
         particle.px0_xyz_stack = torch.flip(particle.px0_xyz_stack, [0,])
 
-    return particles, weight_history
+    return particles
 
 
-def save_outputs(sampler, particles, weight_history):
+def save_outputs(sampler, particles):
     # out_prefix
     log = logging.getLogger(__name__)
 
@@ -383,7 +352,6 @@ def save_outputs(sampler, particles, weight_history):
             device = torch.cuda.get_device_name(torch.cuda.current_device()) if torch.cuda.is_available() else 'CPU',
             px0_xyz_stack = px0_xyz_stack.detach().cpu().numpy(),
             indep={k:v.detach().cpu().numpy() for k,v in dataclasses.asdict(indep).items()},
-            weight_history=weight_history,
         )
         if hasattr(particle, 'contig_map'):
             for key, value in particle.contig_map.get_mappings().items():

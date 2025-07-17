@@ -36,6 +36,9 @@ inference:
   infer_guidepost_positions: True
   guidepost_xyz_as_design: True
   guidepost_xyz_as_design_bb: [False]
+  trajectory_model_path: null
+  resample_schedule: [150, 135, 120, 105, 90, 75]
+  particles: 4
 
 contigmap:
   contigs: ['20', 'A3-23', '30']
