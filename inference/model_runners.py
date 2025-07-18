@@ -238,19 +238,19 @@ class Sampler:
         """Creates initial features to start the sampling process."""
 
         # moved this here as should be updated each iteration of diffusion
-        self.contig_map = self.construct_contig(self.target_feats)
+        contig_map = self.construct_contig(self.target_feats)
         L = len(self.target_feats['pdb_idx'])
 
         indep_orig = aa_model.make_indep(self._conf.inference.input_pdb, self._conf.inference.ligand)
-        indep, self.is_diffused, self.is_seq_masked = self.model_adaptor.insert_contig(indep_orig, self.contig_map)
+        indep, is_diffused, is_seq_masked = self.model_adaptor.insert_contig(indep_orig, contig_map)
         self.t_step_input = self._conf.diffuser.T
         if self.diffuser_conf.partial_T:
-            mappings = self.contig_map.get_mappings()
+            mappings = contig_map.get_mappings()
             assert indep.xyz.shape[0] ==  L + torch.sum(indep.is_sm), f"there must be a coordinate in the input PDB for each residue implied by the contig string for partial diffusion.  length of input PDB != length of contig string: {indep.xyz.shape[0]} != {L+torch.sum(indep.is_sm)}"
-            assert torch.all(self.is_diffused[indep.is_sm] == 0), f"all ligand atoms must be in the motif"
+            assert torch.all(is_diffused[indep.is_sm] == 0), f"all ligand atoms must be in the motif"
             assert (mappings['con_hal_idx0'] == mappings['con_ref_idx0']).all(), 'all positions in the input PDB must correspond to the same index in the output pdb'
             indep = indep_orig
-        indep.seq[self.is_seq_masked] = ChemData().MASKINDEX
+        indep.seq[is_seq_masked] = ChemData().MASKINDEX
         # Diffuse the contig-mapped coordinates 
         if self.diffuser_conf.partial_T:
             self.t_step_input = self.diffuser_conf.partial_T
@@ -258,12 +258,12 @@ class Sampler:
         t_list = np.arange(1, self.t_step_input+1)
         atom_mask = None
         seq_one_hot = None
-        fa_stack, xyz_true = self.diffuser.diffuse_pose(
+        fa_stack, _ = self.diffuser.diffuse_pose(
             indep.xyz,
             seq_one_hot,
             atom_mask,
             indep.is_sm,
-            diffusion_mask=~self.is_diffused,
+            diffusion_mask=~is_diffused,
             t_list=t_list,
             diffuse_sidechains=self.preprocess_conf.sidechain_input,
             include_motif_sidechains=self.preprocess_conf.motif_sidechain_input)
@@ -272,25 +272,24 @@ class Sampler:
         xt = torch.clone(xT)
         indep.xyz = xt
 
-        self.denoiser = self.construct_denoiser(len(self.contig_map.ref), visible=~self.is_diffused)
+        denoiser = self.construct_denoiser(len(contig_map.ref), visible=~is_diffused)
         
-        self.msa_prev = None
-        self.pair_prev = None
-        self.state_prev = None
-        
-        return indep
+        return indep, is_diffused, is_seq_masked, denoiser, contig_map
 
 class NRBStyleSelfCond(Sampler):
     """
     Model Runner for self conditioning in the style attempted by NRB
     """
 
-    def sample_step(self, t, indep, rfo):
+    def sample_step(self, t, particle):  # indep, rfo
         '''
         Generate the next pose that the model should be supplied at timestep t-1.
         '''
 
-        rfi = self.model_adaptor.prepro(indep, t, self.is_diffused)
+        indep = particle.indep
+        denoiser = particle.denoiser
+        rfo = particle.rfo
+        rfi = self.model_adaptor.prepro(indep, t, particle.is_diffused)
         rf2aa.tensor_util.to_device(rfi, self.device)
         seq_init = torch.nn.functional.one_hot(
                 indep.seq, num_classes=ChemData().NAATOKENS).to(self.device).float()
@@ -317,7 +316,7 @@ class NRBStyleSelfCond(Sampler):
         pseq_0 = torch.nn.functional.one_hot(
             sampled_seq, num_classes=ChemData().NAATOKENS).to(self.device).float()
         
-        pseq_0[~self.is_seq_masked] = seq_init[~self.is_seq_masked].to(self.device) # [L,22]
+        pseq_0[~particle.is_seq_masked] = seq_init[~particle.is_seq_masked].to(self.device) # [L,22]
 
         now = datetime.now()
         current_time = now.strftime("%H:%M:%S")
@@ -325,12 +324,12 @@ class NRBStyleSelfCond(Sampler):
                 f'{current_time}: Timestep {t}, current sequence: { ChemData().seq2chars(torch.argmax(pseq_0, dim=-1).tolist())}')
 
         if t > self._conf.inference.final_step:
-            x_t_1, seq_t_1, tors_t_1, px0 = self.denoiser.get_next_pose(
+            x_t_1, seq_t_1, tors_t_1, px0 = denoiser.get_next_pose(
                 xt=rfi.xyz[0,:,:14].cpu(),
                 px0=px0,
                 t=t,
-                diffusion_mask=~self.is_diffused,
-                seq_diffusion_mask=~self.is_diffused,
+                diffusion_mask=~particle.is_diffused,
+                seq_diffusion_mask=~particle.is_diffused,
                 seq_t=seq_t,
                 pseq0=pseq_0,
                 diffuse_sidechains=self.preprocess_conf.sidechain_input,
@@ -340,12 +339,12 @@ class NRBStyleSelfCond(Sampler):
         else:
             # Final step.
             px0 = px0.cpu()
-            px0[~self.is_diffused] = indep.xyz[~self.is_diffused]
+            px0[~particle.is_diffused] = indep.xyz[~particle.is_diffused]
             x_t_1 = torch.clone(px0)
             seq_t_1 = pseq_0
 
             # Dummy tors_t_1 prediction. Not used in final output.
-            tors_t_1 = torch.ones((self.is_diffused.shape[-1], 10, 2))
+            tors_t_1 = torch.ones((particle.is_diffused.shape[-1], 10, 2))
 
         px0 = px0.cpu()
         x_t_1 = x_t_1.cpu()

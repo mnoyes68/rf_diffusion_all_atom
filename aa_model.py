@@ -69,6 +69,10 @@ class Indep:
     is_sm: torch.Tensor
     terminus_type: torch.Tensor
 
+    # Related to TDS
+    p = None
+    w = None
+
     def write_pdb(self, path, **kwargs):
         with open(path, kwargs.pop('file_mode', 'w')) as fh:
             return self.write_pdb_file(fh, **kwargs)
@@ -83,6 +87,30 @@ class Indep:
     
     def chains(self):
         return chain_letters_from_same_chain(self.same_chain)
+
+    def clone(self):
+        seq = self.seq.clone()
+        xyz = self.xyz.clone()
+        idx = self.idx.clone()
+        bond_feats = self.bond_feats.clone()
+        chirals = self.chirals.clone()
+        atom_frames = self.atom_frames.clone()
+        same_chain = self.same_chain.clone()
+        is_sm = self.is_sm.clone()
+        terminus_type = self.terminus_type.clone()
+
+        return type(self)(
+            seq,
+            xyz,
+            idx,
+            bond_feats,
+            chirals,
+            atom_frames,
+            same_chain,
+            is_sm,
+            terminus_type
+        )
+
 
 @dataclass
 class RFI:
@@ -134,6 +162,22 @@ class RFO:
     
     def get_xyz(self):
         return self.xyz_allatom[0]
+
+    def clone(self):
+        return type(self)(
+            tuple([l.clone() for l in self.logits]),
+            self.logits_aa.clone(),
+            self.logits_pae.clone(),
+            self.logits_pde.clone(),
+            self.p_bind.clone(),
+            self.xyz.clone(),
+            self.alpha_s.clone(),
+            self.xyz_allatom.clone(),
+            self.lddt.clone(),
+            self.msa.clone(),
+            self.pair.clone(),
+            self.state.clone(),
+        )
 
 def filter_het(pdb_lines, ligand):
     lines = []
@@ -407,8 +451,6 @@ class Model:
         xyz[0, is_protein_motif, 14:] = 0
 
         dist_matrix = get_bond_distances(indep.bond_feats)
-
-        
 
         # minor tweaks to rfi to match gp training
         if ('inference' in self.conf) and (self.conf.inference.get('contig_as_guidepost', False)):

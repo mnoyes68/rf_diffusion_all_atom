@@ -40,6 +40,7 @@ import copy
 import e3nn.o3 as o3
 
 from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import RadiusGraph
 
 def warm_up_spherical_harmonics():
@@ -77,7 +78,9 @@ def main(conf: HydraConfig) -> None:
     sampler = get_sampler(conf)
 
     print("Loading Trajectory Model")
-    trajectory_model = torch.jit.load(conf.inference.trajectory_model_path)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    trajectory_model = torch.jit.load(conf.inference.trajectory_model_path).to(device)
+    trajectory_model.eval()
     print("Loaded Trajectory Model")
 
     sample(sampler, conf, trajectory_model)
@@ -179,13 +182,14 @@ def resample(particles: list[Particle]) -> list[Particle]:
 
     # Get the weights
     weights = torch.Tensor([p.weight for p in particles])
-    if torch.isnan(weight).any():
+    if torch.isnan(weights).any():
         raise ValueError("NaN detected during resampling")
     weights = weights / torch.sum(weights)
+    w_sort = weights.sort(descending=True)
     weights = weights.sort(descending=True).values
 
     # Resort particles
-    particles = [particles[i] for i in weights.indices]
+    particles = [particles[i] for i in w_sort.indices]
 
     # Get the indices to resample
     cumulative = torch.cumsum(weights, dim=0)
@@ -211,15 +215,33 @@ def resample(particles: list[Particle]) -> list[Particle]:
 
 
 def evaluate_trajectory(particles, t, trajectory_model):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     transform = RadiusGraph(r=4)
+
     for p in particles:
-        xyz = p.indep.xyz
+        xyz = p.px0_xyz_stack[-1].clone()
         coords = xyz[:, [0, 1, 2], :].reshape(-1, 3)
 
         pos = torch.tensor(coords, dtype=torch.float)
         meta = torch.tensor(t/200, dtype=torch.float).to(device)
         data = Data(pos=pos, meta=meta)
         data = transform(data)
+
+        data_loader = DataLoader([data], batch_size=1, shuffle=False)
+    
+        # Get the single batched data
+        batched_data = next(iter(data_loader))
+        batched_data = batched_data.to(device)
+        
+        # Make prediction
+        pred = trajectory_model(
+            batched_data.pos, batched_data.edge_index, batched_data.batch, batched_data.meta
+        )
+
+        print(f"TRAJECTORY SCORE at {t}: {pred.item()}")
+        p.weight = pred.item()
+
+    return
 
 
 def sample(sampler, conf, trajectory_model):
@@ -251,20 +273,14 @@ def sample_batch(sampler, conf, i_des, trajectory_model, simple_logging=False):
 
     # Loop over number of reverse diffusion time steps.
     for t in range(int(conf.diffuser.T), conf.inference.final_step-1, -1):
-        # if t in conf.inference.resample_schedule:
-        if t < 2:
+        if t in conf.inference.resample_schedule:
             evaluate_trajectory(particles, t, trajectory_model)
             particles = resample(particles)
 
         for particle in particles:
             indep = particle.indep
             rfo = particle.rfo
-            # px0, x_t, seq_t, opt_lp, cond_lp, p_t, tors_t, plddt, rfo = (
-            #     sampler.sample_step(t, particle)
-            # )
-            px0, x_t, seq_t, tors_t, plddt, rfo = sampler.sample_step(
-                t, indep, rfo
-            )
+            px0, x_t, seq_t, tors_t, plddt, rfo = sampler.sample_step(t, particle)
             rf2aa.tensor_util.assert_same_shape(indep.xyz, x_t)
             indep.xyz = x_t
 
@@ -292,7 +308,7 @@ def save_outputs(sampler, particles):
 
     for i, particle in enumerate(particles):
         indep = particle.indep
-        out_prefix = f"{sampler.output_prefix}{chr(ord('a') + i)}"
+        out_prefix = f"{sampler.output_prefix}__{i}"
         denoised_xyz_stack = particle.denoised_xyz_stack
         px0_xyz_stack = particle.px0_xyz_stack
         seq_stack = particle.seq_stack
