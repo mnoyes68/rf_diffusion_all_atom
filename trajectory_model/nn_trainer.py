@@ -64,13 +64,7 @@ class BackbonePointNet(torch.nn.Module):
         edge_index: Tensor,
         batch: Tensor,
         timestep: Tensor,
-    ) -> Tensor:
-        # t_emb = self.timestep_embedding(timestep.unsqueeze(-1))
-        # t_emb_expanded = t_emb[batch]
-        
-        # Enhanced point features
-        # enhanced_pos = torch.cat([pos, t_emb_expanded], dim=-1)
-        
+    ) -> Tensor:        
         # Perform three layers of message passing:
         h = self.conv1(h=pos, pos=pos, edge_index=edge_index)
         h = h.relu()

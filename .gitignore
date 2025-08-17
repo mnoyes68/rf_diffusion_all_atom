@@ -1,3 +1,4 @@
 output/
 inference/__pycache__/
 slurm*
+trajectory_model/chabc_trajectory_prediction/

@@ -33,12 +33,16 @@ Note that LigandMPNN expects to be installed via `conda`. Chai can be installed 
 In order to run the pipeline from the paper, follow the steps below. Note that this is assumed to be ran on a shared cluster using SLURM, that can take in `sbatch` files. If this is being ran on a different environment, the commands in the `.sbatch` files should still be valid with some adjustment.
 
 ```
+# Clone the model
+git clone https://huggingface.co/mnoyes68/chabc_trajectory_prediction trajectory_model/
+
 # Call with argument syntax:
 # - 1: Path to repository
 # - 2: Output prefix
 # - 3: Design start number
 # - 4: Number of particles
-sbatch examples/backbone_generation.sbatch <path/to/rf_diffusion_all_atom> output/test 0 16
+# - 5: Path to the trajectory model
+sbatch examples/backbone_generation.sbatch <path/to/rf_diffusion_all_atom> output/test 0 16 trajectory_model/chabc_trajectory_prediction/
 
 # Prepare the input for LigandMPNN
 python get_fixed_sites.py ../LigandMPNN output/ fixed_sites.json
@@ -59,6 +63,16 @@ sbatch examples/structure_prediction.sbatch <path/to/rf_diffusion_all_atom> chai
 # Get the Chai1 Output
 python scripts/parse_chai_output.py predictions/ chai_output.csv
 ```
+
+## Trajcetory Model
+
+The trajectory model is the model responsible for predicting the final PTM of a backbone during resampling. It lives at the Huggingface repository [here](https://huggingface.co/mnoyes68/chabc_trajectory_prediction). If you are interested in modifying it, follow the steps below.
+
+1. Complete the pipeline above to generate a `chai_output.csv` file.
+2. Make a new directory to store the model in `mkdir trajectory_model/new_model`
+3. Generate a dataset by running `python trajectory_model/generate_dataset.py chai_output.csv output/ trajectory_model/new_model/backbone_dataset.npy`. This will output a file `backbone_dataset.npy` that is in the format expected by the model.
+4. Run the training script using the command `python trajectory_model/nn_trainer.py trajectory_model/new_model/backbone_dataset.npy trajectory_model/new_model/` to train a new model using the existing architecture. Adjust the other parameters in that script as you see fit.
+5. Once that is done, modify the `sbatch` command above to use `trajectory_model/new_model/` as the new trajectory model to generate backbone data for your model.
 
 ## Acknowledgements
 
