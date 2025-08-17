@@ -1,67 +1,65 @@
-Code for RFDiffusion AA
---------------------
-<p align="center">
-  <img src="./img/RFDiffusionAA.png" alt="alt text" width="600px"/>
-</p>
+# RFDiffusionAA with Resampling
 
-### Setup/Installation
-1. Clone the package
+This repository is a fork of [RFDiffusion All-Atom](https://github.com/baker-laboratory/rf_diffusion_all_atom), a protein diffusion model used for generating _de novo_ protein backbones. This repository has been forked to implement resampling using particle filtering. This is the code repository containing the code from the paper **Resampling Techniques to Improve RFDiffusion Results for de novo Design of an Enzyme Based on Chondroitinase ABC Lyase I**.
+
+## Installation
+
+Follow the script below to install this environment. Note that it is recommended to use `python3.9` for this installation, though it may work with other versions depending on your CUDA version.
+
 ```
-git clone https://github.com/baker-laboratory/rf_diffusion_all_atom.git
-cd rf_diffusion_all_atom
-```
-2. Download the container used to run RFAA.
-```
-wget http://files.ipd.uw.edu/pub/RF-All-Atom/containers/rf_se3_diffusion.sif
-```
-3. Download the model weights.
-```
-wget http://files.ipd.uw.edu/pub/RF-All-Atom/weights/RFDiffusionAA_paper_weights.pt
+python3.9 -m venv rfdenv
+source rfdenv/bin/activate
+pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+pip install torch_geometric
+pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
+pip install omegaconf hydra-core scipy icecream openbabel-wheel assertpy opt_einsum pandas pydantic deepdiff e3nn fire scikit-learn torchdata==0.9.0
+pip install --pre dgl -f https://data.dgl.ai/wheels-test/torch-2.4/cu121/repo.html
 ```
 
-4. Initialize git submodules
+Alternatively, if you are using CUDA 12.1, you can run `pip install -r requirements.txt` to get started.
+
+### Additional Models
+
+The pipeline in the paper additionally specifies LigandMPNN and Chai1 as models to use for the downstream steps. They are not included in this repository, but if you wish to follow the full pipeline, follow the instructions for installing the models below.
+- [LigandMPNN](https://github.com/dauparas/LigandMPNN)
+- [Chai1](https://github.com/chaidiscovery/chai-lab)
+
+Note that LigandMPNN expects to be installed via `conda`. Chai can be installed with `pip` but requires Python >= 3.10. If using the pipeline below, the sbatch files will expect to be able to find the following environments for these models
+- `ligandmpnn_env`
+- `chai`
+
+## Pipeline
+
+In order to run the pipeline from the paper, follow the steps below. Note that this is assumed to be ran on a shared cluster using SLURM, that can take in `sbatch` files. If this is being ran on a different environment, the commands in the `.sbatch` files should still be valid with some adjustment.
+
 ```
-git submodule init
-git submodule update
-```
-5. Install Apptainer
+# Call with argument syntax:
+# - 1: Path to repository
+# - 2: Output prefix
+# - 3: Design start number
+# - 4: Number of particles
+sbatch examples/backbone_generation.sbatch <path/to/rf_diffusion_all_atom> output/test 0 16
 
-Install apptainer if you do not already have it on your system.  This will allow you to run our code without installing any python packages using a prepackaged sif: https://apptainer.org/docs/admin/main/installation.html
+# Prepare the input for LigandMPNN
+python get_fixed_sites.py ../LigandMPNN output/ fixed_sites.json
 
+# Run LigandMPNN
+sbatch examples/sequence_recovery.sbatch <path/to/ligand_mpnn> fixed_sites.json sequences/
 
-### Inference
-#### Small molecule binder design
+# Prepare the input for Chai1
+python scripts/prepare_chai_input.py sequences/ chai_input.csv fa_files/
 
-To generate a binder to the ligand OQO from PDB 7v11, run the following:
+# If running with a ligand, create a constraints file to represent the connection between structure/ligand.
+# Currently this is hardcoded to represent the ligand in 7yke.
+python scripts/create_constraints.py output/ fa_files/
 
+# Run Chai1
+sbatch examples/structure_prediction.sbatch <path/to/rf_diffusion_all_atom> chai_input.csv fa_files/ predictions/ 0
 
-Example (ligand binder):
-```
-/usr/bin/apptainer run --nv rf_se3_diffusion.sif -u run_inference.py inference.deterministic=True diffuser.T=100 inference.output_prefix=output/ligand_only/sample inference.input_pdb=input/7v11.pdb contigmap.contigs=[\'150-150\'] inference.ligand=OQO inference.num_designs=1 inference.design_startnum=0
-```
-
-Note: The --nv flag must be omitted if not using a GPU.
-
-Explanation of arguments:
-- `inference.deterministic=True` seeds the random number generators used so that results are reproducible.  i.e. running with inference.design_startnum=X will produce the same reusults.  Note that torch does not guarantee reproducibility across CPU/GPU architectures: https://pytorch.org/docs/stable/notes/randomness.html
-- `inference.num_designs=1` specifies that 1 design will be generated
-- `contigmap.contigs=[\'150-150\']` specifies that the length of the generated protein should be 150
-- `diffuser.T=100` specifies the number of denoising steps taken.
-
-Expected outputs:
-- `output/ligand_only/sample_0.pdb` The design PDB
-- `output/ligand_only/sample_0_Xt-1_traj.pdb` The partially denoised intermediate structures
-- `output/ligand_only/sample_0_X0-1_traj.pdb` The predictions of the ground truth made by the network at each step
-
-Note that the sequences associated with these structure have no meaning, apart from the given motif.  LigandMPNN or similar must be used to generate sequences for the backbones if they are to be used for structure prediction / expression.
-
-To include protein residues A430-435 in the motif, use the argument contigmap.contigs.  e.g. `contigmap.contigs=[\'10-120,A84-87,10-120\']` tells the model to design a protein containing the 4 residue motif A84-87 with 10-120 residues on either side.
-
-#### Small molecule binder design with protein motif
-Example (ligand binder with protein motif):
-```
-/usr/bin/apptainer run --nv rf_se3_diffusion.sif -u run_inference.py inference.deterministic=True diffuser.T=200 inference.output_prefix=output/ligand_protein_motif/sample inference.input_pdb=input/1haz.pdb contigmap.contigs=[\'10-120,A84-87,10-120\'] contigmap.length="150-150" inference.ligand=CYC inference.num_designs=1 inference.design_startnum=0
+# Get the Chai1 Output
+python scripts/parse_chai_output.py predictions/ chai_output.csv
 ```
 
-An end-to-end design pipeline illustrating the design of heme-binding proteins using RFdiffusionAA, proteinMPNN, AlphaFold2, LigandMPNN and PyRosetta is available at: https://github.com/ikalvet/heme_binder_diffusion
+## Acknowledgements
 
+Thank you to @w-ahern, @r-krishna and @ikalvet for your hard work on RFDiffusion All-Atom, which made this research possible.

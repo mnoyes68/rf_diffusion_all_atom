@@ -42,6 +42,7 @@ import e3nn.o3 as o3
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import RadiusGraph
+from trajectory_model.nn_trainer import BackbonePointNet
 
 def warm_up_spherical_harmonics():
     ''' o3.spherical_harmonics returns different values on 1st call vs all subsequent calls
@@ -79,11 +80,20 @@ def main(conf: HydraConfig) -> None:
 
     print("Loading Trajectory Model")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    trajectory_model = torch.jit.load(conf.inference.trajectory_model_path).to(device)
+
+    trajectory_model = BackbonePointNet().to(device)
+    state_dict = torch.load(os.path.join(conf.inference.trajectory_model_path, 'model_weights.pth'))
+    trajectory_model.load_state_dict(state_dict)
     trajectory_model.eval()
     print("Loaded Trajectory Model")
 
-    sample(sampler, conf, trajectory_model)
+    scaler = np.load(
+        os.path.join(conf.inference.trajectory_model_path, 'scaler.npy'),
+        allow_pickle=True
+    ).item()
+    print("Loaded Trajectory Scaler")
+
+    sample(sampler, conf, trajectory_model, scaler)
 
 def get_sampler(conf):
     if conf.inference.deterministic:
@@ -126,8 +136,8 @@ class Particle:
         denoised_xyz_stack=None,
         px0_xyz_stack=None,
         seq_stack=None,
+        weight_stack=None,
         rfo=None,
-        weight=None
     ):
         self.indep = indep
         self.is_diffused = is_diffused
@@ -139,10 +149,12 @@ class Particle:
         self.denoised_xyz_stack = denoised_xyz_stack if denoised_xyz_stack else []
         self.px0_xyz_stack = px0_xyz_stack if px0_xyz_stack else []
         self.seq_stack = seq_stack if seq_stack else []
+        self.weight_stack = weight_stack if weight_stack else []
         self.rfo = rfo
 
-        # Stats from sampling
-        self.weight = weight
+    @property
+    def weight(self):
+        return self.weight_stack[-1]
 
     def clone(self):
         """Clone this particle to continue diffusing"""
@@ -155,8 +167,8 @@ class Particle:
         denoised_xyz_stack = [d.clone() for d in self.denoised_xyz_stack]
         px0_xyz_stack = [p.clone() for p in self.px0_xyz_stack]
         seq_stack = [s.clone() for s in self.seq_stack]
+        weight_stack = [w for w in self.weight_stack]
         rfo = self.rfo.clone()
-        weight = self.weight.clone()
 
         return type(self)(
             indep,
@@ -167,8 +179,8 @@ class Particle:
             denoised_xyz_stack,
             px0_xyz_stack,
             seq_stack,
+            weight_stack,
             rfo,
-            weight
         )
 
 
@@ -184,6 +196,12 @@ def resample(particles: list[Particle]) -> list[Particle]:
     weights = torch.Tensor([p.weight for p in particles])
     if torch.isnan(weights).any():
         raise ValueError("NaN detected during resampling")
+    
+    # Maximize the difference between the weights
+    weights = torch.clamp(weights - 0.5, min=0.0)
+    weights = weights ** 2
+    if torch.sum(weights) == 0:
+        raise ValueError("All weights are zero. Reconsider sampling.")
     weights = weights / torch.sum(weights)
     w_sort = weights.sort(descending=True)
     weights = weights.sort(descending=True).values
@@ -214,13 +232,15 @@ def resample(particles: list[Particle]) -> list[Particle]:
     return resampled_particles
 
 
-def evaluate_trajectory(particles, t, trajectory_model):
+def evaluate_trajectory(particles, t, trajectory_model, scaler):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    transform = RadiusGraph(r=4)
+    transform = RadiusGraph(r=4/scaler['global_scale'])
 
     for p in particles:
         xyz = p.px0_xyz_stack[-1].clone()
         coords = xyz[:, [0, 1, 2], :].reshape(-1, 3)
+        coords = coords - scaler['global_centroid']
+        coords = coords / scaler['global_scale']
 
         pos = torch.tensor(coords, dtype=torch.float)
         meta = torch.tensor(t/200, dtype=torch.float).to(device)
@@ -238,13 +258,12 @@ def evaluate_trajectory(particles, t, trajectory_model):
             batched_data.pos, batched_data.edge_index, batched_data.batch, batched_data.meta
         )
 
-        print(f"TRAJECTORY SCORE at {t}: {pred.item()}")
-        p.weight = pred.item()
+        p.weight_stack.append(pred.item())
 
     return
 
 
-def sample(sampler, conf, trajectory_model):
+def sample(sampler, conf, trajectory_model, scaler):
     inf = conf.inference
 
     log = logging.getLogger(__name__)
@@ -258,12 +277,12 @@ def sample(sampler, conf, trajectory_model):
         out_prefix = f"{sampler.inf_conf.output_prefix}_{i_des}"
         sampler.output_prefix = out_prefix
         log.info(f'Making batch design {i_des} of {des_i_start}:{des_i_end}')
-        particles = sample_batch(sampler, conf, i_des, trajectory_model)
+        particles = sample_batch(sampler, conf, i_des, trajectory_model, scaler)
         log.info(f'Finished batch design in {(time.time()-start_time)/60:.2f} minutes')
         save_outputs(sampler, particles)
 
 
-def sample_batch(sampler, conf, i_des, trajectory_model, simple_logging=False):
+def sample_batch(sampler, conf, i_des, trajectory_model, scaler, simple_logging=False):
     particles = []
     for i in range(conf.inference.particles):
         indep, is_diffused, is_seq_masked, denoiser, contig_map = sampler.sample_init()
@@ -274,7 +293,6 @@ def sample_batch(sampler, conf, i_des, trajectory_model, simple_logging=False):
     # Loop over number of reverse diffusion time steps.
     for t in range(int(conf.diffuser.T), conf.inference.final_step-1, -1):
         if t in conf.inference.resample_schedule:
-            evaluate_trajectory(particles, t, trajectory_model)
             particles = resample(particles)
 
         for particle in particles:
@@ -291,6 +309,8 @@ def sample_batch(sampler, conf, i_des, trajectory_model, simple_logging=False):
             particle.denoised_xyz_stack.append(x_t)
             particle.seq_stack.append(seq_t)
             particle.rfo = rfo
+
+        evaluate_trajectory(particles, t, trajectory_model, scaler)
 
     # Flip order for better visualization in pymol
     for particle in particles:
@@ -311,6 +331,7 @@ def save_outputs(sampler, particles):
         out_prefix = f"{sampler.output_prefix}__{i}"
         denoised_xyz_stack = particle.denoised_xyz_stack
         px0_xyz_stack = particle.px0_xyz_stack
+        weight_stack = particle.weight_stack
         seq_stack = particle.seq_stack
 
         final_seq = seq_stack[-1]
@@ -367,6 +388,7 @@ def save_outputs(sampler, particles):
             config = OmegaConf.to_container(sampler._conf, resolve=True),
             device = torch.cuda.get_device_name(torch.cuda.current_device()) if torch.cuda.is_available() else 'CPU',
             px0_xyz_stack = px0_xyz_stack.detach().cpu().numpy(),
+            weight_stack = weight_stack,
             indep={k:v.detach().cpu().numpy() for k,v in dataclasses.asdict(indep).items()},
         )
         if hasattr(particle, 'contig_map'):
